@@ -9,7 +9,6 @@
     <version>1.0-SNAPSHOT</version>
 
     <properties>
-        <!-- 主程式相容 Java 17 以上；Launcher.java 另外用 Java 8 格式編譯（見下方 compiler plugin） -->
         <maven.compiler.release>17</maven.compiler.release>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     </properties>
@@ -21,7 +20,7 @@
             <artifactId>gson</artifactId>
             <version>2.11.0</version>
         </dependency>
-        <!-- 產生自簽 TLS 憑證 -->
+        <!-- TLS Certificate -->
         <dependency>
             <groupId>org.bouncycastle</groupId>
             <artifactId>bcpkix-jdk18on</artifactId>
@@ -51,7 +50,6 @@
                             </excludes>
                         </configuration>
                     </execution>
-                    <!-- 入口 Launcher 用 Java 8 格式編譯，舊版 Java 才讀得進來並顯示說明 -->
                     <execution>
                         <id>compile-launcher</id>
                         <phase>compile</phase>
@@ -67,7 +65,6 @@
                     </execution>
                 </executions>
             </plugin>
-            <!-- mvn package 會產生可直接執行的 target/LocalTransfer.jar -->
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-shade-plugin</artifactId>
