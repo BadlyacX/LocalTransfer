@@ -21,7 +21,11 @@ public final class Discovery implements AutoCloseable {
     }
 
     private static final String MAGIC = "LT1";
+    private static final String WAKE = "LT1W";
     private static final long EXPIRE_MS = 10_000;
+    private static final long WAKE_REPLY_GAP_MS = 300;
+
+    private final Map<String, Long> lastWakeReply = new ConcurrentHashMap<>();
 
     private final Settings settings;
     private final String fingerprint;
@@ -94,8 +98,12 @@ public final class Discovery implements AutoCloseable {
 
     private void handle(String msg, InetAddress from) {
         String[] p = msg.split("\t", -1);
+        if (p.length == 3 && p[0].equals(WAKE)) {
+            handleWake(p[1], p[2], from);
+            return;
+        }
         if (p.length != 5 || !p[0].equals(MAGIC)) return;
-        if (p[1].equals(settings.deviceId)) return; // 自己
+        if (p[1].equals(settings.deviceId)) return;
         int port = Integer.parseInt(p[3]);
         long now = System.currentTimeMillis();
         String src = from.getHostAddress();
@@ -118,17 +126,28 @@ public final class Discovery implements AutoCloseable {
         if (old == null || !old.peer().equals(peer)) fire();
     }
 
+    private byte[] announcement() {
+        String name = settings.deviceName().replace('\t', ' ');
+        return String.join("\t", MAGIC, settings.deviceId, name,
+                String.valueOf(settings.port), fingerprint).getBytes(StandardCharsets.UTF_8);
+    }
+
+    private void sendTo(byte[] data, InetAddress addr) {
+        try {
+            tx.send(new DatagramPacket(data, data.length, addr, settings.discoveryPort));
+        } catch (IOException | RuntimeException ignored) {
+        }
+    }
+
     private void announceLoop() {
         while (running) {
             try {
-                String name = settings.deviceName().replace('\t', ' ');
-                byte[] data = String.join("\t", MAGIC, settings.deviceId, name,
-                        String.valueOf(settings.port), fingerprint).getBytes(StandardCharsets.UTF_8);
-                for (InetAddress addr : NetUtil.broadcastAddresses()) {
+                byte[] data = announcement();
+                for (InetAddress addr : NetUtil.broadcastAddresses()) sendTo(data, addr);
+                for (String host : knownHosts()) {
                     try {
-                        tx.send(new DatagramPacket(data, data.length, addr, settings.discoveryPort));
+                        sendTo(data, InetAddress.getByName(host));
                     } catch (IOException ignored) {
-
                     }
                 }
                 sweep();
@@ -137,6 +156,40 @@ public final class Discovery implements AutoCloseable {
                 return;
             }
         }
+    }
+
+    private List<String> knownHosts() {
+        java.util.Set<String> set = new java.util.LinkedHashSet<>();
+        for (Entry e : entries.values()) set.add(e.peer().host());
+        long now = System.currentTimeMillis();
+        for (Map<String, Long> hosts : hostSeen.values()) {
+            hosts.forEach((h, t) -> {
+                if (now - t <= EXPIRE_MS) set.add(h);
+            });
+        }
+        return new ArrayList<>(set);
+    }
+
+    public void requestContact(String targetId) {
+        if (!running || targetId == null) return;
+        byte[] data = String.join("\t", WAKE, settings.deviceId, targetId).getBytes(StandardCharsets.UTF_8);
+        for (InetAddress addr : NetUtil.broadcastAddresses()) sendTo(data, addr);
+        for (String host : hostsOf(targetId)) {
+            try {
+                sendTo(data, InetAddress.getByName(host));
+            } catch (IOException ignored) {
+            }
+        }
+    }
+
+    private void handleWake(String fromId, String targetId, InetAddress from) {
+        if (!targetId.equals(settings.deviceId) || fromId.equals(settings.deviceId)) return;
+        String src = from.getHostAddress();
+        long now = System.currentTimeMillis();
+        Long last = lastWakeReply.get(src);
+        if (last != null && now - last < WAKE_REPLY_GAP_MS) return;
+        lastWakeReply.put(src, now);
+        sendTo(announcement(), from);
     }
 
     private void sweep() {

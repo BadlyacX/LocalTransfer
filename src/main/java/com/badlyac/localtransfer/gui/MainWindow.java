@@ -19,6 +19,8 @@ import javax.swing.table.AbstractTableModel;
 import javax.swing.table.TableCellRenderer;
 import java.awt.*;
 import java.awt.datatransfer.DataFlavor;
+import java.awt.event.MouseAdapter;
+import java.awt.event.MouseEvent;
 import java.awt.event.WindowAdapter;
 import java.awt.event.WindowEvent;
 import java.awt.image.BufferedImage;
@@ -38,7 +40,20 @@ public final class MainWindow extends JFrame {
     private final JList<Path> fileList;
     private final JButton sendBtn = new JButton("傳送給所選裝置");
     private final TaskModel taskModel = new TaskModel();
-    private final JTable taskTable = new JTable(taskModel);
+    private final JTable taskTable = new JTable(taskModel) {
+        // 狀態欄放不下長訊息：滑鼠停在該列就顯示完整訊息。
+        @Override
+        public String getToolTipText(MouseEvent e) {
+            int row = rowAtPoint(e.getPoint());
+            if (row < 0) return null;
+            TransferTask t = taskModel.at(convertRowIndexToModel(row));
+            if (t.message.isEmpty()) return null;
+            return "<html><body style='width:420px'>" + escape(t.message).replace("\n", "<br>")
+                    + "<br><br><i>雙擊可開啟詳細資訊並複製</i></body></html>";
+        }
+    };
+    /** 已自動跳出過錯誤詳細的傳輸，避免重複跳出。 */
+    private final java.util.Set<String> failureShown = java.util.concurrent.ConcurrentHashMap.newKeySet();
     private final JLabel infoLabel = new JLabel();
 
     public static void launch(Settings settings) {
@@ -78,6 +93,20 @@ public final class MainWindow extends JFrame {
         };
 
         app.hub.addListener(taskModel);
+        // 自己送出的傳輸失敗時，自動跳出完整錯誤（狀態欄只放得下一小段）。
+        app.hub.addListener(new TransferHub.Listener() {
+            @Override
+            public void taskAdded(TransferTask t) {
+            }
+
+            @Override
+            public void taskUpdated(TransferTask t) {
+                if (t.direction == TransferTask.Direction.SEND && t.state == TransferTask.State.FAILED
+                        && failureShown.add(t.id)) {
+                    SwingUtilities.invokeLater(() -> showTaskDetail(t));
+                }
+            }
+        });
         app.discovery.setListener(peers -> SwingUtilities.invokeLater(() -> refreshPeers(peers)));
         app.shares.setOnChange(() -> {
         });
@@ -107,6 +136,57 @@ public final class MainWindow extends JFrame {
         });
         setSize(900, 640);
         setLocationRelativeTo(null);
+        promptDefenderIfNeeded();
+    }
+
+    // ------------------------------------------------------------ Windows Defender 排除（啟動時詢問一次）
+
+    private void promptDefenderIfNeeded() {
+        if (!com.badlyac.localtransfer.DefenderExclusion.isWindows() || app.settings.defenderAsked()) return;
+        Path dir = app.settings.downloadDir();
+        com.badlyac.localtransfer.Threads.start("lt-defender-check", () -> {
+            if (app.settings.defenderAsked()) return;
+            // 一般權限多半讀不到排除清單（UNKNOWN），這時仍詢問一次。
+            if (com.badlyac.localtransfer.DefenderExclusion.status(dir)
+                    == com.badlyac.localtransfer.DefenderExclusion.Status.EXCLUDED) {
+                app.settings.setDefenderAsked(true);
+                return;
+            }
+            SwingUtilities.invokeLater(() -> {
+                if (!app.settings.defenderAsked()) showDefenderDialog(dir);
+            });
+        });
+    }
+
+    private void showDefenderDialog(Path dir) {
+        String msg = "<html><body style='width:400px'>"
+                + "<b>加快接收大量檔案的速度</b><br><br>"
+                + "Windows Defender 的即時掃描會在每個收到的檔案寫入時掃描，傳大量小檔案時這通常是主要的速度瓶頸。"
+                + "可以把接收資料夾加入 Defender 的排除清單來避免：<br><br>"
+                + "<code>" + escape(dir.toString()) + "</code><br><br>"
+                + "<font color='gray'>注意：排除後這個資料夾內的檔案不再被即時掃描；此處會收到來自其他裝置的檔案，"
+                + "請只在你信任來源時使用。加入需要系統管理員權限（會跳出 UAC 視窗讓你確認）。</font>"
+                + "</body></html>";
+        Object[] options = {"加入排除（需要管理員）", "略過"};
+        int r = JOptionPane.showOptionDialog(this, msg, "Windows Defender 排除",
+                JOptionPane.YES_NO_OPTION, JOptionPane.QUESTION_MESSAGE, null, options, options[1]);
+        app.settings.setDefenderAsked(true); // 只詢問一次，無論加入或略過
+        if (r == 0) addDefenderExclusion(dir);
+    }
+
+    private void addDefenderExclusion(Path dir) {
+        com.badlyac.localtransfer.Threads.start("lt-defender-add", () -> {
+            var result = com.badlyac.localtransfer.DefenderExclusion.requestAdd(dir);
+            String msg = switch (result) {
+                case ADDED -> "已把接收資料夾加入 Windows Defender 排除清單。";
+                case CANCELLED -> "已取消（UAC 視窗按了「否」）。之後可按上方「Defender 排除」再試一次。";
+                case FAILED -> "加入失敗：這台電腦可能未啟用 Windows Defender（例如改用其他防毒軟體），"
+                        + "或被系統原則禁止修改排除清單。";
+            };
+            boolean ok = result == com.badlyac.localtransfer.DefenderExclusion.Result.ADDED;
+            SwingUtilities.invokeLater(() -> JOptionPane.showMessageDialog(this, msg, "Windows Defender 排除",
+                    ok ? JOptionPane.INFORMATION_MESSAGE : JOptionPane.WARNING_MESSAGE));
+        });
     }
 
     // ------------------------------------------------------------ layout
@@ -125,6 +205,12 @@ public final class MainWindow extends JFrame {
         topBtns.add(rename);
         topBtns.add(folder);
         topBtns.add(qr);
+        if (com.badlyac.localtransfer.DefenderExclusion.isWindows()) {
+            JButton defender = new JButton("Defender 排除");
+            defender.setToolTipText("把接收資料夾加入 Windows Defender 即時掃描排除清單（需要系統管理員權限）");
+            defender.addActionListener(e -> showDefenderDialog(app.settings.downloadDir()));
+            topBtns.add(defender);
+        }
         top.add(topBtns, BorderLayout.EAST);
 
         JSplitPane mid = new JSplitPane(JSplitPane.HORIZONTAL_SPLIT, peersPanel(), sendPanel());
@@ -246,7 +332,18 @@ public final class MainWindow extends JFrame {
         taskTable.getColumnModel().getColumn(2).setPreferredWidth(240);
         taskTable.getColumnModel().getColumn(3).setPreferredWidth(220);
         taskTable.getColumnModel().getColumn(3).setCellRenderer(new ProgressRenderer());
-        taskTable.getColumnModel().getColumn(4).setPreferredWidth(160);
+        taskTable.getColumnModel().getColumn(4).setPreferredWidth(260);
+        ToolTipManager.sharedInstance().registerComponent(taskTable);
+        ToolTipManager.sharedInstance().setDismissDelay(60_000);
+        taskTable.addMouseListener(new MouseAdapter() {
+            @Override
+            public void mouseClicked(MouseEvent e) {
+                if (e.getClickCount() == 2) {
+                    int row = taskTable.rowAtPoint(e.getPoint());
+                    if (row >= 0) showTaskDetail(taskModel.at(taskTable.convertRowIndexToModel(row)));
+                }
+            }
+        });
         p.add(new JScrollPane(taskTable), BorderLayout.CENTER);
 
         JPanel btns = new JPanel(new FlowLayout(FlowLayout.LEFT, 4, 0));
@@ -267,11 +364,46 @@ public final class MainWindow extends JFrame {
                 JOptionPane.showMessageDialog(this, "下載資料夾還不存在（收到第一個檔案後就會建立）");
             }
         });
+        JButton detail = new JButton("查看詳細");
+        detail.addActionListener(e -> {
+            int row = taskTable.getSelectedRow();
+            if (row < 0) {
+                JOptionPane.showMessageDialog(this, "請先在傳輸紀錄中點選一筆");
+                return;
+            }
+            showTaskDetail(taskModel.at(taskTable.convertRowIndexToModel(row)));
+        });
         btns.add(cancel);
+        btns.add(detail);
         btns.add(clearDone);
         btns.add(open);
         p.add(btns, BorderLayout.SOUTH);
         return p;
+    }
+
+    /** 顯示一筆傳輸的完整資訊（含錯誤訊息），文字可選取複製。 */
+    private void showTaskDetail(TransferTask t) {
+        String text = "方向：" + (t.direction == TransferTask.Direction.SEND ? "傳送" : "接收")
+                + "\n對象：" + t.peerName
+                + "\n內容：" + t.title
+                + "\n狀態：" + TaskModel.statusName(t)
+                + "\n進度：" + Fmt.bytes(t.done()) + " / " + Fmt.bytes(t.totalBytes)
+                + "\n\n訊息：\n" + (t.message.isEmpty() ? "（無）" : t.message);
+        JTextArea area = new JTextArea(text, 14, 64);
+        area.setEditable(false);
+        area.setLineWrap(true);
+        area.setWrapStyleWord(true);
+        area.setCaretPosition(0);
+        JButton copy = new JButton("複製");
+        copy.addActionListener(e -> Toolkit.getDefaultToolkit().getSystemClipboard()
+                .setContents(new java.awt.datatransfer.StringSelection(text), null));
+        JPanel panel = new JPanel(new BorderLayout(0, 6));
+        panel.add(new JScrollPane(area), BorderLayout.CENTER);
+        JPanel south = new JPanel(new FlowLayout(FlowLayout.LEFT, 0, 0));
+        south.add(copy);
+        panel.add(south, BorderLayout.SOUTH);
+        JOptionPane.showMessageDialog(this, panel, "傳輸詳細資訊",
+                t.state == TransferTask.State.FAILED ? JOptionPane.WARNING_MESSAGE : JOptionPane.INFORMATION_MESSAGE);
     }
 
     // ------------------------------------------------------------ actions
@@ -358,7 +490,8 @@ public final class MainWindow extends JFrame {
                 SwingUtilities.invokeLater(() -> field.setText(""));
             } catch (Exception e) {
                 SwingUtilities.invokeLater(() -> JOptionPane.showMessageDialog(this,
-                        "連不到 " + h + ":" + pt + "\n" + e.getMessage(), "加入失敗", JOptionPane.ERROR_MESSAGE));
+                        "連不到 " + h + ":" + pt + "\n原因：" + com.badlyac.localtransfer.TransferClient.describe(e),
+                        "加入失敗", JOptionPane.ERROR_MESSAGE));
             } finally {
                 SwingUtilities.invokeLater(() -> field.setEnabled(true));
             }
@@ -576,6 +709,18 @@ public final class MainWindow extends JFrame {
             };
         }
 
+        static String statusName(TransferTask t) {
+            return switch (t.state) {
+                case WAITING_CONFIRM -> t.direction == TransferTask.Direction.SEND ? "等待對方確認" : "等待你確認";
+                case HASHING -> "計算校驗碼";
+                case TRANSFERRING -> "傳輸中";
+                case DONE -> "完成";
+                case FAILED -> "失敗";
+                case REJECTED -> "已拒絕";
+                case CANCELLED -> "已取消";
+            };
+        }
+
         private static String statusText(TransferTask t) {
             String s = switch (t.state) {
                 case WAITING_CONFIRM -> t.direction == TransferTask.Direction.SEND ? "等待對方確認" : "等待你確認";
@@ -586,8 +731,11 @@ public final class MainWindow extends JFrame {
                 case REJECTED -> "已拒絕";
                 case CANCELLED -> "已取消";
             };
-            return t.message.isEmpty() || t.state == TransferTask.State.WAITING_CONFIRM || t.state == TransferTask.State.HASHING
-                    ? s : s + "：" + t.message;
+            if (t.message.isEmpty() || t.state == TransferTask.State.WAITING_CONFIRM || t.state == TransferTask.State.HASHING)
+                return s;
+            // 表格儲存格只顯示第一行；完整內容看滑鼠提示或「查看詳細」。
+            int nl = t.message.indexOf('\n');
+            return s + "：" + (nl < 0 ? t.message : t.message.substring(0, nl) + " …");
         }
     }
 

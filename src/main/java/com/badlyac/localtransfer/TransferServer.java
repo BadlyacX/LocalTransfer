@@ -9,13 +9,13 @@ import com.badlyac.localtransfer.Protocol.FileEntry;
 import com.badlyac.localtransfer.Protocol.Info;
 import com.badlyac.localtransfer.Protocol.OfferRequest;
 import com.badlyac.localtransfer.Protocol.OfferResponse;
-import com.badlyac.localtransfer.Protocol.OffsetResponse;
 import com.badlyac.localtransfer.Protocol.SharedItem;
 import com.badlyac.localtransfer.TransferTask.Direction;
 import com.badlyac.localtransfer.TransferTask.State;
 
 import java.io.IOException;
-import java.nio.channels.Channels;
+import java.io.RandomAccessFile;
+import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.file.StandardOpenOption;
 import java.io.InputStream;
@@ -53,9 +53,22 @@ public final class TransferServer implements AutoCloseable {
 
     private static final int MAX_FILES = 100_000;
     private static final long SESSION_IDLE_MS = 120_000;
+    static final int CHUNK_SIZE = 8 * 1024 * 1024;
     static final String PARTIAL_DIR = ".lt-partial";
 
-    private final Set<Path> busyParts = ConcurrentHashMap.newKeySet();
+    static {
+        if (System.getProperty("sun.net.httpserver.nodelay") == null) {
+            System.setProperty("sun.net.httpserver.nodelay", "true");
+        }
+    }
+
+    private final Set<Path> knownDirs = ConcurrentHashMap.newKeySet();
+
+    private void ensureDir(Path dir) throws IOException {
+        if (knownDirs.contains(dir)) return;
+        Files.createDirectories(dir);
+        knownDirs.add(dir);
+    }
 
     private final Settings settings;
     private final TlsManager tls;
@@ -118,10 +131,8 @@ public final class TransferServer implements AutoCloseable {
                 json(ex, 200, new Info(Protocol.VERSION, settings.deviceId, settings.deviceName(), tls.fingerprint()));
             } else if (method.equals("POST") && path.equals("/api/offer")) {
                 offer(ex);
-            } else if (method.equals("PUT") && path.startsWith("/api/upload/")) {
-                upload(ex, path);
-            } else if (method.equals("GET") && path.startsWith("/api/upload/")) {
-                uploadOffset(ex, path);
+            } else if (method.equals("PUT") && path.startsWith("/api/chunk/")) {
+                uploadChunk(ex, path);
             } else if (method.equals("GET") && path.equals("/api/shared")) {
                 sharedList(ex);
             } else if (method.equals("GET") && path.startsWith("/api/shared/")) {
@@ -146,23 +157,54 @@ public final class TransferServer implements AutoCloseable {
         final List<FileEntry> files;
         final Path[] targets;
         final Path[] parts;
-        final boolean[] active;
-        final boolean[] done;
-        final AtomicInteger finished = new AtomicInteger();
+        final int chunkSize;
+        final int[] chunkCount;
+        final boolean[][] have;
+        final int[] remainingChunks;
+        final Object[] locks;
+        final boolean[] sized;
+        final boolean[] fileDone;
+        final boolean[] finalizing;
+        final AtomicInteger finishedFiles = new AtomicInteger();
         volatile long lastActivity = System.currentTimeMillis();
 
-        Session(String id, TransferTask task, List<FileEntry> files, Path[] targets, Path[] parts) {
+        Session(String id, TransferTask task, List<FileEntry> files, Path[] targets, Path[] parts,
+                int chunkSize, int[] chunkCount, boolean[][] have, int[] remaining) {
             this.id = id;
             this.task = task;
             this.files = files;
             this.targets = targets;
             this.parts = parts;
-            this.active = new boolean[files.size()];
-            this.done = new boolean[files.size()];
+            this.chunkSize = chunkSize;
+            this.chunkCount = chunkCount;
+            this.have = have;
+            this.remainingChunks = remaining;
+            int n = files.size();
+            this.locks = new Object[n];
+            for (int i = 0; i < n; i++) locks[i] = new Object();
+            this.sized = new boolean[n];
+            this.fileDone = new boolean[n];
+            this.finalizing = new boolean[n];
         }
 
         void touch() {
             lastActivity = System.currentTimeMillis();
+        }
+
+        void ensureSized(int i) throws IOException {
+            if (sized[i]) return;
+            synchronized (locks[i]) {
+                if (sized[i]) return;
+                Files.createDirectories(parts[i].getParent());
+                try (RandomAccessFile r = new RandomAccessFile(parts[i].toFile(), "rw")) {
+                    if (r.length() != files.get(i).size()) r.setLength(files.get(i).size());
+                }
+                sized[i] = true;
+            }
+        }
+
+        Path mapPath(int i) {
+            return parts[i].resolveSibling(parts[i].getFileName() + ".map");
         }
     }
 
@@ -202,68 +244,81 @@ public final class TransferServer implements AutoCloseable {
             return;
         }
 
+        int n = files.size();
         Path root = settings.downloadDir();
         Files.createDirectories(root);
         Path[] targets = planTargets(root, files);
-
         Path partialDir = root.resolve(PARTIAL_DIR);
-        Path[] parts = new Path[files.size()];
-        long[] offsets = new long[files.size()];
+
+        Path[] parts = new Path[n];
+        int[] chunkCount = new int[n];
+        boolean[][] have = new boolean[n][];
+        int[] remaining = new int[n];
+        String[] resume = new String[n];
         long resumed = 0;
-        for (int i = 0; i < files.size(); i++) {
+        int alreadyDone = 0;
+
+        Session s = null;
+
+        for (int i = 0; i < n; i++) {
             FileEntry fe = files.get(i);
-            if (fe.sha256() != null && fe.sha256().matches("[0-9a-f]{64}")) {
+            boolean addressable = fe.sha256() != null && fe.sha256().matches("[0-9a-f]{64}");
+            if (addressable) {
                 Files.createDirectories(partialDir);
                 parts[i] = partialDir.resolve(fe.sha256() + "-" + fe.size() + ".part");
-                if (Files.isRegularFile(parts[i])) {
-                    long have = Files.size(parts[i]);
-                    if (have <= fe.size()) {
-                        offsets[i] = have;
-                        resumed += have;
-                    } else {
-                        Files.delete(parts[i]);
-                    }
-                }
             } else {
                 parts[i] = targets[i].resolveSibling(targets[i].getFileName() + ".part");
             }
+            int cc = ChunkMap.chunkCount(fe.size(), CHUNK_SIZE);
+            chunkCount[i] = cc;
+            have[i] = new boolean[cc];
+
+            if (cc == 0) {
+                ensureDir(targets[i].getParent());
+                if (!Files.exists(targets[i])) Files.createFile(targets[i]);
+                remaining[i] = 0;
+                alreadyDone++;
+                resume[i] = "";
+                continue;
+            }
+
+            Path mp = parts[i].resolveSibling(parts[i].getFileName() + ".map");
+            if (Files.isRegularFile(parts[i]) && Files.isRegularFile(mp) && Files.size(parts[i]) == fe.size()) {
+                have[i] = ChunkMap.decode(Files.readString(mp, StandardCharsets.UTF_8).trim(), cc);
+            }
+            int done = 0;
+            for (int c = 0; c < cc; c++) {
+                if (have[i][c]) {
+                    done++;
+                    resumed += chunkLen(fe.size(), c, CHUNK_SIZE);
+                }
+            }
+            remaining[i] = cc - done;
+            resume[i] = ChunkMap.encode(have[i]);
         }
 
         byte[] idBytes = new byte[16];
         new SecureRandom().nextBytes(idBytes);
         String id = Hashing.hex(idBytes);
-        sessions.put(id, new Session(id, task, files, targets, parts));
+        s = new Session(id, task, files, targets, parts, CHUNK_SIZE, chunkCount, have, remaining);
+        s.finishedFiles.set(alreadyDone);
+
         task.setDone(resumed);
         task.resumedBytes = resumed;
-        hub.setState(task, State.TRANSFERRING, resumed > 0 ? "從上次中斷處繼續（已有 " + Fmt.bytes(resumed) + "）" : "");
-        json(ex, 200, new OfferResponse(true, id, null, offsets));
+
+        if (alreadyDone == n) {
+            hub.setState(task, State.DONE, "");
+        } else {
+            sessions.put(id, s);
+            hub.setState(task, State.TRANSFERRING,
+                    resumed > 0 ? "從上次中斷處繼續（已有 " + Fmt.bytes(resumed) + "）" : "");
+        }
+        json(ex, 200, new OfferResponse(true, id, null, CHUNK_SIZE, resume));
     }
 
-    private void uploadOffset(HttpExchange ex, String path) throws IOException {
-        String[] seg = path.split("/");
-        if (seg.length != 5) throw new BadRequest("bad path");
-        Session s = sessions.get(seg[3]);
-        if (s == null) {
-            send(ex, 404, "text/plain; charset=utf-8", "unknown transfer".getBytes(StandardCharsets.UTF_8));
-            return;
-        }
-        int idx = parseIndex(seg[4], s);
-        long have = 0;
-        synchronized (s) {
-            if (s.done[idx]) have = s.files.get(idx).size();
-            else if (!s.active[idx] && Files.isRegularFile(s.parts[idx]))
-                have = Math.min(Files.size(s.parts[idx]), s.files.get(idx).size());
-        }
-        json(ex, 200, new OffsetResponse(have));
-    }
-
-    private static int parseIndex(String raw, Session s) {
-        try {
-            int idx = Integer.parseInt(raw);
-            if (idx >= 0 && idx < s.files.size()) return idx;
-        } catch (NumberFormatException ignored) {
-        }
-        throw new BadRequest("bad index");
+    private static long chunkLen(long size, int chunkIndex, int chunkSize) {
+        long offset = (long) chunkIndex * chunkSize;
+        return Math.min(chunkSize, size - offset);
     }
 
     private static final class ChecksumException extends IOException {
@@ -272,119 +327,155 @@ public final class TransferServer implements AutoCloseable {
         }
     }
 
-    private void upload(HttpExchange ex, String path) throws IOException {
-        String[] seg = path.split("/"); // "", "api", "upload", id, index
-        if (seg.length != 5) throw new BadRequest("bad path");
+    private void uploadChunk(HttpExchange ex, String path) throws IOException {
+        String[] seg = path.split("/"); // "", "api", "chunk", id, fileIndex, chunkIndex
+        if (seg.length != 6) throw new BadRequest("bad path");
         Session s = sessions.get(seg[3]);
         if (s == null) {
             send(ex, 404, "text/plain; charset=utf-8", "unknown transfer".getBytes(StandardCharsets.UTF_8));
             return;
         }
-        int idx = parseIndex(seg[4], s);
-        long offset;
+        int fi = parseIndex(seg[4], s.files.size());
+        int ci = parseIndex(seg[5], s.chunkCount[fi]);
+        FileEntry fe = s.files.get(fi);
+        long offset = (long) ci * s.chunkSize;
+        int len = (int) chunkLen(fe.size(), ci, s.chunkSize);
+
+        String cl = ex.getRequestHeaders().getFirst("Content-Length");
         try {
-            String o = query(ex, "offset");
-            offset = o == null ? 0 : Long.parseLong(o);
+            if (cl == null || Long.parseLong(cl) != len) throw new BadRequest("Content-Length 與分塊大小不符：" + fe.path());
         } catch (NumberFormatException e) {
-            throw new BadRequest("bad offset");
+            throw new BadRequest("bad content-length");
         }
-        FileEntry fe = s.files.get(idx);
-        if (offset < 0 || offset > fe.size()) throw new BadRequest("bad offset");
-        Path part = s.parts[idx];
-        synchronized (s) {
-            if (s.done[idx] || s.active[idx] || !busyParts.add(part)) {
-                send(ex, 409, "text/plain; charset=utf-8", "already uploaded or in progress".getBytes(StandardCharsets.UTF_8));
+
+        s.touch();
+        if (!s.task.message.isEmpty() && s.task.state == State.TRANSFERRING)
+            hub.setState(s.task, State.TRANSFERRING, "");
+
+        synchronized (s.locks[fi]) {
+            if (s.fileDone[fi] || s.have[fi][ci]) {
+                send(ex, 200, "text/plain; charset=utf-8", "ok".getBytes(StandardCharsets.UTF_8));
                 return;
             }
-            s.active[idx] = true;
         }
+
         try {
-            if (!s.task.message.isEmpty() && s.task.state == State.TRANSFERRING)
-                hub.setState(s.task, State.TRANSFERRING, "");
-            String cl = ex.getRequestHeaders().getFirst("Content-Length");
-            if (cl == null || Long.parseLong(cl) != fe.size() - offset)
-                throw new BadRequest("Content-Length 與宣告不符：" + fe.path());
-            Files.createDirectories(part.getParent());
-
-            long have = Files.isRegularFile(part) ? Files.size(part) : 0;
-            if (have < offset) throw new BadRequest("暫存資料不足，請重新查詢偏移量：" + fe.path());
-            if (have > offset) s.task.addDone(-(have - offset));
-
-            MessageDigest md = Hashing.newDigest();
-            byte[] buf = new byte[64 * 1024];
-            if (offset > 0) {
-                try (InputStream pin = Files.newInputStream(part)) {
-                    long left = offset;
-                    while (left > 0) {
-                        int n = pin.read(buf, 0, (int) Math.min(buf.length, left));
-                        if (n < 0) throw new IOException("暫存檔損毀：" + fe.path());
-                        md.update(buf, 0, n);
-                        left -= n;
-                    }
-                }
-            }
-            long remaining = fe.size() - offset;
-            try (FileChannel ch = FileChannel.open(part, StandardOpenOption.CREATE, StandardOpenOption.WRITE);
+            s.ensureSized(fi);
+            byte[] buf = new byte[256 * 1024];
+            ByteBuffer bb = ByteBuffer.wrap(buf);
+            long pos = offset;
+            long left = len;
+            try (FileChannel ch = FileChannel.open(s.parts[fi], StandardOpenOption.WRITE);
                  InputStream in = ex.getRequestBody()) {
-                ch.truncate(offset);
-                ch.position(offset);
-                OutputStream out = Channels.newOutputStream(ch);
-                while (remaining > 0) {
+                while (left > 0) {
                     if (s.task.cancelRequested) throw new CancelledException();
-                    int n = in.read(buf, 0, (int) Math.min(buf.length, remaining));
-                    if (n < 0) throw new IOException("連線中斷，檔案不完整：" + fe.path());
-                    out.write(buf, 0, n);
-                    md.update(buf, 0, n);
-                    remaining -= n;
-                    s.task.addDone(n);
+                    int n = in.read(buf, 0, (int) Math.min(buf.length, left));
+                    if (n < 0) throw new IOException("連線中斷，分塊不完整：" + fe.path());
+                    bb.limit(n).position(0);
+                    while (bb.hasRemaining()) pos += ch.write(bb, pos);
+                    left -= n;
                     s.touch();
-                    hub.update(s.task);
                 }
             }
-            String got = Hashing.hex(md.digest());
-            if (fe.sha256() != null && !fe.sha256().equals(got)) {
-                Files.deleteIfExists(part);
-                throw new ChecksumException("SHA-256 校驗失敗：" + fe.path());
+
+            boolean complete;
+            synchronized (s.locks[fi]) {
+                if (!s.have[fi][ci]) {
+                    s.have[fi][ci] = true;
+                    s.remainingChunks[fi]--;
+                    persistMap(s, fi);
+                    s.task.addDone(len);
+                }
+                complete = s.remainingChunks[fi] == 0 && !s.finalizing[fi];
+                if (complete) s.finalizing[fi] = true;
             }
-            Files.createDirectories(s.targets[idx].getParent());
-            Files.move(part, s.targets[idx]);
-            synchronized (s) {
-                s.done[idx] = true;
-            }
-            ex.getResponseHeaders().set("X-SHA256", got);
+            hub.update(s.task);
+
+            if (complete) finalizeFile(s, fi);
             send(ex, 200, "text/plain; charset=utf-8", "ok".getBytes(StandardCharsets.UTF_8));
 
-            if (s.finished.incrementAndGet() == s.files.size()) {
-                sessions.remove(s.id);
-                hub.setState(s.task, State.DONE, "");
-            }
         } catch (CancelledException e) {
             failSession(s, State.CANCELLED, "已取消", true);
             sendQuietly(ex, 499, "cancelled");
         } catch (ChecksumException e) {
-            failSession(s, State.FAILED, e.getMessage(), false);
+            failSession(s, State.FAILED, e.getMessage(), true);
             sendQuietly(ex, 422, e.getMessage());
         } catch (BadRequest e) {
             sendQuietly(ex, 400, e.getMessage());
         } catch (IOException | RuntimeException e) {
+            if (e instanceof java.nio.file.NoSuchFileException) knownDirs.clear();
             hub.setState(s.task, State.TRANSFERRING, "連線中斷，等待對方重新連線…");
             sendQuietly(ex, 500, String.valueOf(e.getMessage()));
-        } finally {
-            synchronized (s) {
-                s.active[idx] = false;
-            }
-            busyParts.remove(part);
         }
+    }
+
+    private void finalizeFile(Session s, int fi) throws IOException {
+        FileEntry fe = s.files.get(fi);
+        MessageDigest md = Hashing.newDigest();
+        try (FileChannel ch = FileChannel.open(s.parts[fi], StandardOpenOption.READ)) {
+            ByteBuffer bb = ByteBuffer.allocate(256 * 1024);
+            long pos = 0, size = fe.size();
+            while (pos < size) {
+                bb.clear();
+                int n = ch.read(bb, pos);
+                if (n < 0) throw new IOException("重讀暫存檔時提前結束：" + fe.path());
+                md.update(bb.array(), 0, n);
+                pos += n;
+            }
+        }
+        String got = Hashing.hex(md.digest());
+
+        if (fe.sha256() != null && !fe.sha256().equals(got)) {
+            try {
+                Files.deleteIfExists(s.parts[fi]);
+                Files.deleteIfExists(s.mapPath(fi));
+            } catch (IOException ignored) {
+            }
+            throw new ChecksumException("SHA-256 校驗失敗：" + fe.path());
+        }
+
+        ensureDir(s.targets[fi].getParent());
+        Files.move(s.parts[fi], s.targets[fi], java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+        try {
+            Files.deleteIfExists(s.mapPath(fi));
+        } catch (IOException ignored) {
+        }
+        synchronized (s.locks[fi]) {
+            s.fileDone[fi] = true;
+        }
+        if (s.finishedFiles.incrementAndGet() == s.files.size()) {
+            sessions.remove(s.id);
+            hub.setState(s.task, State.DONE, "");
+        }
+    }
+
+    private static void persistMap(Session s, int fi) {
+        try {
+            Files.writeString(s.mapPath(fi), ChunkMap.encode(s.have[fi]), StandardCharsets.UTF_8);
+        } catch (IOException ignored) {
+
+        }
+    }
+
+    private static int parseIndex(String raw, int bound) {
+        try {
+            int idx = Integer.parseInt(raw);
+            if (idx >= 0 && idx < bound) return idx;
+        } catch (NumberFormatException ignored) {
+        }
+        throw new BadRequest("bad index");
     }
 
     private void failSession(Session s, State state, String message, boolean deleteAll) {
         if (!sessions.remove(s.id, s)) return;
-        for (Path p : s.parts) {
+        for (int i = 0; i < s.parts.length; i++) {
+            Path p = s.parts[i];
             boolean persistent = p.getParent() != null && p.getParent().getFileName() != null
                     && p.getParent().getFileName().toString().equals(PARTIAL_DIR);
             if (deleteAll || !persistent) {
                 try {
                     Files.deleteIfExists(p);
+                    Files.deleteIfExists(s.mapPath(i));
                 } catch (IOException ignored) {
                 }
             }

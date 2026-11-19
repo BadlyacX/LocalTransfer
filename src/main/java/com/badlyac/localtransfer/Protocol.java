@@ -6,7 +6,7 @@ public final class Protocol {
     private Protocol() {
     }
 
-    public static final int VERSION = 1;
+    public static final int VERSION = 2;
 
     public record FileEntry(String path, long size, String sha256) {
     }
@@ -14,13 +14,10 @@ public final class Protocol {
     public record OfferRequest(String sender, List<FileEntry> files) {
     }
 
-    public record OfferResponse(boolean accepted, String transferId, String reason, long[] offsets) {
+    public record OfferResponse(boolean accepted, String transferId, String reason, int chunkSize, String[] resume) {
         public OfferResponse(boolean accepted, String transferId, String reason) {
-            this(accepted, transferId, reason, null);
+            this(accepted, transferId, reason, 0, null);
         }
-    }
-
-    public record OffsetResponse(long offset) {
     }
 
     public record Info(int version, String id, String name, String fingerprint) {

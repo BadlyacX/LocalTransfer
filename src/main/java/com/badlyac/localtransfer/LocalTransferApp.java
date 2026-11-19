@@ -21,6 +21,7 @@ public final class LocalTransferApp implements AutoCloseable {
         this.client = new TransferClient(settings, hub);
         this.discovery = new Discovery(settings, tls.fingerprint());
         this.client.setAlternates(discovery::hostsOf);
+        this.client.setWaker(discovery::requestContact);
     }
 
     public void start() throws IOException, GeneralSecurityException {

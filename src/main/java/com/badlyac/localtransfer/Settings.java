@@ -19,6 +19,7 @@ public final class Settings {
     public final boolean autoAccept;
     private volatile String deviceName;
     private volatile Path downloadDir;
+    private volatile boolean defenderAsked;
 
     private Settings(Path dataDir, String deviceId, String deviceName, Path downloadDir,
                      int port, int discoveryPort, boolean autoAccept) {
@@ -50,6 +51,7 @@ public final class Settings {
         Path dl = downloadOverride != null ? downloadOverride
                 : Path.of(p.getProperty("downloadDir", defaultDownloadDir().toString()));
         Settings s = new Settings(dataDir, id, name, dl, port, discoveryPort, autoAccept);
+        s.defenderAsked = Boolean.parseBoolean(p.getProperty("defenderAsked", "false"));
         s.save();
         return s;
     }
@@ -59,6 +61,7 @@ public final class Settings {
         p.setProperty("id", deviceId);
         p.setProperty("name", deviceName);
         p.setProperty("downloadDir", downloadDir.toString());
+        p.setProperty("defenderAsked", String.valueOf(defenderAsked));
         try (var out = Files.newBufferedWriter(dataDir.resolve("settings.properties"), StandardCharsets.UTF_8)) {
             p.store(out, "LocalTransfer settings");
         } catch (IOException e) {
@@ -72,6 +75,15 @@ public final class Settings {
 
     public void setDeviceName(String name) {
         this.deviceName = name;
+        save();
+    }
+
+    public boolean defenderAsked() {
+        return defenderAsked;
+    }
+
+    public void setDefenderAsked(boolean v) {
+        this.defenderAsked = v;
         save();
     }
 

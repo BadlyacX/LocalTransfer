@@ -13,6 +13,18 @@ public final class Threads {
         return t;
     }
 
+    public static ExecutorService newFixedDaemonPool(String prefix, int size) {
+        int[] counter = {0};
+        return Executors.newFixedThreadPool(size, r -> {
+            Thread t;
+            synchronized (counter) {
+                t = new Thread(r, prefix + "-" + (++counter[0]));
+            }
+            t.setDaemon(true);
+            return t;
+        });
+    }
+
     public static ExecutorService newDaemonPool(String prefix) {
         int[] counter = {0};
         return Executors.newCachedThreadPool(r -> {
