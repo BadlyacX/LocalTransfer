@@ -17,21 +17,33 @@ public final class Discovery implements AutoCloseable {
         void peersChanged(List<Peer> peers);
     }
 
+    public interface ContactListener {
+        void peerAppeared(Peer peer);
+
+        void wakeRequested(String fromId, String host, int port);
+    }
+
     private record Entry(Peer peer, long lastSeen, boolean manual) {
     }
 
     private static final String MAGIC = "LT1";
     private static final String WAKE = "LT1W";
     private static final long EXPIRE_MS = 10_000;
-    private static final long WAKE_REPLY_GAP_MS = 300;
-
-    private final Map<String, Long> lastWakeReply = new ConcurrentHashMap<>();
 
     private final Settings settings;
     private final String fingerprint;
     private final Map<String, Entry> entries = new ConcurrentHashMap<>();
     private final Map<String, Map<String, Long>> hostSeen = new ConcurrentHashMap<>();
     private volatile Listener listener = peers -> {
+    };
+    private volatile ContactListener contact = new ContactListener() {
+        @Override
+        public void peerAppeared(Peer peer) {
+        }
+
+        @Override
+        public void wakeRequested(String fromId, String host, int port) {
+        }
     };
     private volatile boolean running;
     private DatagramSocket rx;
@@ -44,6 +56,22 @@ public final class Discovery implements AutoCloseable {
 
     public void setListener(Listener l) {
         this.listener = l;
+    }
+
+    public void setContactListener(ContactListener c) {
+        this.contact = c;
+    }
+
+    public Peer peer(String id) {
+        Entry e = entries.get(id);
+        return e == null ? null : e.peer();
+    }
+
+    private void notifyAppeared(Peer peer) {
+        try {
+            contact.peerAppeared(peer);
+        } catch (RuntimeException ignored) {
+        }
     }
 
     public void start() throws IOException {
@@ -79,6 +107,7 @@ public final class Discovery implements AutoCloseable {
     public void addManual(Peer peer) {
         entries.put(peer.id(), new Entry(peer, System.currentTimeMillis(), true));
         fire();
+        notifyAppeared(peer);
     }
 
     private void receiveLoop() {
@@ -98,8 +127,15 @@ public final class Discovery implements AutoCloseable {
 
     private void handle(String msg, InetAddress from) {
         String[] p = msg.split("\t", -1);
-        if (p.length == 3 && p[0].equals(WAKE)) {
-            handleWake(p[1], p[2], from);
+        if ((p.length == 3 || p.length == 4) && p[0].equals(WAKE)) {
+            int wakePort = -1;
+            if (p.length == 4) {
+                try {
+                    wakePort = Integer.parseInt(p[3]);
+                } catch (NumberFormatException ignored) {
+                }
+            }
+            handleWake(p[1], p[2], wakePort, from);
             return;
         }
         if (p.length != 5 || !p[0].equals(MAGIC)) return;
@@ -124,6 +160,8 @@ public final class Discovery implements AutoCloseable {
         Peer peer = new Peer(p[1], p[2], host, port, p[4]);
         entries.put(peer.id(), new Entry(peer, now, old != null && old.manual()));
         if (old == null || !old.peer().equals(peer)) fire();
+        if (old == null || !old.peer().host().equals(peer.host()) || old.peer().port() != peer.port())
+            notifyAppeared(peer);
     }
 
     private byte[] announcement() {
@@ -172,7 +210,8 @@ public final class Discovery implements AutoCloseable {
 
     public void requestContact(String targetId) {
         if (!running || targetId == null) return;
-        byte[] data = String.join("\t", WAKE, settings.deviceId, targetId).getBytes(StandardCharsets.UTF_8);
+        byte[] data = String.join("\t", WAKE, settings.deviceId, targetId, String.valueOf(settings.port))
+                .getBytes(StandardCharsets.UTF_8);
         for (InetAddress addr : NetUtil.broadcastAddresses()) sendTo(data, addr);
         for (String host : hostsOf(targetId)) {
             try {
@@ -182,14 +221,16 @@ public final class Discovery implements AutoCloseable {
         }
     }
 
-    private void handleWake(String fromId, String targetId, InetAddress from) {
+    private void handleWake(String fromId, String targetId, int port, InetAddress from) {
         if (!targetId.equals(settings.deviceId) || fromId.equals(settings.deviceId)) return;
-        String src = from.getHostAddress();
-        long now = System.currentTimeMillis();
-        Long last = lastWakeReply.get(src);
-        if (last != null && now - last < WAKE_REPLY_GAP_MS) return;
-        lastWakeReply.put(src, now);
-        sendTo(announcement(), from);
+        if (port <= 0) {
+            Peer known = peer(fromId);
+            port = known != null ? known.port() : Settings.DEFAULT_PORT;
+        }
+        try {
+            contact.wakeRequested(fromId, from.getHostAddress(), port);
+        } catch (RuntimeException ignored) {
+        }
     }
 
     private void sweep() {

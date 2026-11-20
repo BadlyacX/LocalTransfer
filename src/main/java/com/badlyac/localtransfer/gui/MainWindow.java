@@ -41,7 +41,6 @@ public final class MainWindow extends JFrame {
     private final JButton sendBtn = new JButton("傳送給所選裝置");
     private final TaskModel taskModel = new TaskModel();
     private final JTable taskTable = new JTable(taskModel) {
-        // 狀態欄放不下長訊息：滑鼠停在該列就顯示完整訊息。
         @Override
         public String getToolTipText(MouseEvent e) {
             int row = rowAtPoint(e.getPoint());
@@ -52,7 +51,7 @@ public final class MainWindow extends JFrame {
                     + "<br><br><i>雙擊可開啟詳細資訊並複製</i></body></html>";
         }
     };
-    /** 已自動跳出過錯誤詳細的傳輸，避免重複跳出。 */
+
     private final java.util.Set<String> failureShown = java.util.concurrent.ConcurrentHashMap.newKeySet();
     private final JLabel infoLabel = new JLabel();
 
@@ -93,7 +92,6 @@ public final class MainWindow extends JFrame {
         };
 
         app.hub.addListener(taskModel);
-        // 自己送出的傳輸失敗時，自動跳出完整錯誤（狀態欄只放得下一小段）。
         app.hub.addListener(new TransferHub.Listener() {
             @Override
             public void taskAdded(TransferTask t) {
@@ -108,6 +106,7 @@ public final class MainWindow extends JFrame {
             }
         });
         app.discovery.setListener(peers -> SwingUtilities.invokeLater(() -> refreshPeers(peers)));
+        app.setOnReachChanged(() -> SwingUtilities.invokeLater(peerList::repaint));
         app.shares.setOnChange(() -> {
         });
         if (!app.settings.autoAccept) {
@@ -139,14 +138,13 @@ public final class MainWindow extends JFrame {
         promptDefenderIfNeeded();
     }
 
-    // ------------------------------------------------------------ Windows Defender 排除（啟動時詢問一次）
+    // ------------------------------------------------------------ Windows Defender Exclude (ask when first start up)
 
     private void promptDefenderIfNeeded() {
         if (!com.badlyac.localtransfer.DefenderExclusion.isWindows() || app.settings.defenderAsked()) return;
         Path dir = app.settings.downloadDir();
         com.badlyac.localtransfer.Threads.start("lt-defender-check", () -> {
             if (app.settings.defenderAsked()) return;
-            // 一般權限多半讀不到排除清單（UNKNOWN），這時仍詢問一次。
             if (com.badlyac.localtransfer.DefenderExclusion.status(dir)
                     == com.badlyac.localtransfer.DefenderExclusion.Status.EXCLUDED) {
                 app.settings.setDefenderAsked(true);
@@ -233,8 +231,24 @@ public final class MainWindow extends JFrame {
             public Component getListCellRendererComponent(JList<?> list, Object value, int index, boolean sel, boolean focus) {
                 super.getListCellRendererComponent(list, value, index, sel, focus);
                 Peer peer = (Peer) value;
-                setText("<html><b>" + escape(peer.name()) + "</b><br><small>" + peer.host() + ":" + peer.port()
+                var r = app.reachOf(peer.id());
+                String status;
+                String tip;
+                if (r == null) {
+                    status = "<font color='gray'>連線確認中…</font>";
+                    tip = "正在用 TCP 確認能否連上這台裝置";
+                } else if (r.ok()) {
+                    status = "<font color='#1a7f37'>✓ 已確認可連線</font>";
+                    tip = "最近一次 TCP 連線確認成功";
+                } else {
+                    status = "<font color='#cf222e'>⚠ 無法確認連線</font>";
+                    tip = "最近一次 TCP 連線確認失敗：" + r.error() + "（每 30 秒自動重試）";
+                }
+                if (r != null && !r.ok() && app.isConfirming(peer.id())) status += " <font color='gray'>重試中…</font>";
+                setText("<html><b>" + escape(peer.name()) + "</b>　" + (sel ? escape(stripTags(status)) : status)
+                        + "<br><small>" + peer.host() + ":" + peer.port()
                         + "　指紋 " + peer.shortFingerprint() + "</small></html>");
+                setToolTipText(tip);
                 return this;
             }
         });
@@ -381,7 +395,6 @@ public final class MainWindow extends JFrame {
         return p;
     }
 
-    /** 顯示一筆傳輸的完整資訊（含錯誤訊息），文字可選取複製。 */
     private void showTaskDetail(TransferTask t) {
         String text = "方向：" + (t.direction == TransferTask.Direction.SEND ? "傳送" : "接收")
                 + "\n對象：" + t.peerName
@@ -566,7 +579,7 @@ public final class MainWindow extends JFrame {
         d.pack();
         d.setLocationRelativeTo(this);
         d.setAlwaysOnTop(true);
-        d.setVisible(true); // 模態：阻塞直到使用者按下按鈕
+        d.setVisible(true);
         timer.stop();
         return result[0];
     }
@@ -645,6 +658,10 @@ public final class MainWindow extends JFrame {
         } catch (Exception e) {
             return new BufferedImage(size, size, BufferedImage.TYPE_INT_RGB);
         }
+    }
+
+    private static String stripTags(String html) {
+        return html.replaceAll("<[^>]*>", "");
     }
 
     private static String escape(String s) {
@@ -733,7 +750,6 @@ public final class MainWindow extends JFrame {
             };
             if (t.message.isEmpty() || t.state == TransferTask.State.WAITING_CONFIRM || t.state == TransferTask.State.HASHING)
                 return s;
-            // 表格儲存格只顯示第一行；完整內容看滑鼠提示或「查看詳細」。
             int nl = t.message.indexOf('\n');
             return s + "：" + (nl < 0 ? t.message : t.message.substring(0, nl) + " …");
         }
