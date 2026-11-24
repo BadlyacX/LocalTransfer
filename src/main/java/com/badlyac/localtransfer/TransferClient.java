@@ -80,6 +80,37 @@ public final class TransferClient {
         this.waker = w;
     }
 
+    public String confirm(String host, int port, String expectedId, String fingerprint, int attempts)
+            throws InterruptedException {
+        String why = "未嘗試";
+        HttpClient http;
+        try {
+            http = newClient(fingerprint, fp -> {
+            });
+        } catch (GeneralSecurityException e) {
+            return describe(e);
+        }
+        for (int i = 0; i < attempts; i++) {
+            try {
+                HttpResponse<String> r = http.send(
+                        HttpRequest.newBuilder(uri(host, port, "/api/info")).timeout(Duration.ofSeconds(4)).GET().build(),
+                        BodyHandlers.ofString(StandardCharsets.UTF_8));
+                if (r.statusCode() != 200) throw new IOException("對方回應 HTTP " + r.statusCode());
+                Info info = gson.fromJson(r.body(), Info.class);
+                if (info == null || info.id() == null) throw new IOException("這個位址上的程式不是 LocalTransfer");
+                if (info.id().equals(settings.deviceId))
+                    throw new IOException("這個位址連到的是本機自己（可能是 IP 位址衝突，或選到錯誤的網路介面）");
+                if (expectedId != null && !info.id().equals(expectedId))
+                    throw new IOException("這個位址上是另一台裝置「" + info.name() + "」");
+                return null;
+            } catch (IOException | RuntimeException e) {
+                why = describe(e);
+            }
+            if (i + 1 < attempts) Thread.sleep(800);
+        }
+        return why;
+    }
+
     private static final int REACH_ROUNDS = 3;
     private static final long WAKE_WAIT_MS = 1500;
 
@@ -149,7 +180,7 @@ public final class TransferClient {
         Throwable root = e;
         while (root.getCause() != null && root.getCause() != root) root = root.getCause();
         String msg = e.getMessage() != null ? e.getMessage() : root.getMessage();
-        if (e.getMessage() != null && e.getClass() == IOException.class) return msg; // 我們自己丟的、已是中文說明
+        if (e.getMessage() != null && e.getClass() == IOException.class) return msg;
         return root.getClass().getSimpleName() + (msg == null ? "" : "：" + msg);
     }
 
