@@ -2,10 +2,7 @@ package com.badlyac.localtransfer;
 
 import com.badlyac.localtransfer.gui.MainWindow;
 import com.badlyac.localtransfer.TransferTask.State;
-
-import java.io.IOException;
 import java.nio.file.Path;
-import java.security.GeneralSecurityException;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;

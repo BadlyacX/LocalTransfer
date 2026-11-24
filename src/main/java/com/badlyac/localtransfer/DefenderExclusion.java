@@ -15,11 +15,8 @@ public final class DefenderExclusion {
     }
 
     public enum Result {
-        /** 已確認在排除清單中。 */
         ADDED,
-        /** 使用者在 UAC 視窗按了「否」或關閉。 */
         CANCELLED,
-        /** 其他失敗（例如沒有啟用 Windows Defender、被群組原則禁止）。 */
         FAILED
     }
 
