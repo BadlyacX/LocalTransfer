@@ -25,6 +25,7 @@ public final class Main {
               --data-dir <dir>         settings and certificate directory
               --download-dir <dir>     where received files are saved
               --auto-accept            accept every incoming transfer without asking
+              --no-update              don't check GitHub for a newer version at startup
             """;
 
     public static void main(String[] args) throws Exception {
@@ -34,6 +35,7 @@ public final class Main {
         List<String> positional = new ArrayList<>();
         boolean headless = false;
         boolean autoAccept = false;
+        boolean noUpdate = false;
         for (int i = 0; i < args.length; i++) {
             String a = args[i];
             switch (a) {
@@ -43,6 +45,7 @@ public final class Main {
                 }
                 case "--headless" -> headless = true;
                 case "--auto-accept" -> autoAccept = true;
+                case "--no-update" -> noUpdate = true;
                 case "--name", "--port", "--discovery-port", "--data-dir", "--download-dir" -> {
                     if (i + 1 >= args.length) {
                         System.err.println("Missing value for " + a);
@@ -67,6 +70,7 @@ public final class Main {
         } else if (headless) {
             runHeadless(settings);
         } else {
+            if (!noUpdate && Updater.checkAndUpdate()) return; // helper replaces the jar and relaunches
             MainWindow.launch(settings);
         }
     }

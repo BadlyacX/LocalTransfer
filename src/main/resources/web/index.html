@@ -345,7 +345,6 @@
             const chunkSize = offer.chunkSize;
             if (!chunkSize) throw new Error('電腦端版本過舊，不支援分塊上傳');
 
-            // 把所有檔案切成分塊，略過電腦端已經收到的（續傳），再用 3 條連線並行上傳
             const queue = [];
             let confirmed = 0;
             for (let fi = 0; fi < files.length; fi++) {
@@ -437,6 +436,11 @@
 
     $('#refresh').onclick = loadShared;
     loadShared();
+    // PC pushes a "refresh" event when it shares/clears files
+    if (token && window.EventSource) {
+        const es = new EventSource('/api/events?t=' + encodeURIComponent(token));
+        es.addEventListener('refresh', loadShared);
+    }
     renderPicked();
 </script>
 </body>

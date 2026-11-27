@@ -219,6 +219,12 @@ public final class MainWindow extends JFrame {
         getContentPane().setLayout(new BorderLayout());
         getContentPane().add(top, BorderLayout.NORTH);
         getContentPane().add(main, BorderLayout.CENTER);
+        JLabel versionLabel = new JLabel("v" + com.badlyac.localtransfer.Updater.currentVersion());
+        versionLabel.setForeground(Color.GRAY);
+        versionLabel.setBorder(BorderFactory.createEmptyBorder(0, 8, 4, 10));
+        JPanel versionBar = new JPanel(new BorderLayout());
+        versionBar.add(versionLabel, BorderLayout.EAST);
+        getContentPane().add(versionBar, BorderLayout.SOUTH);
     }
 
     private JPanel peersPanel() {

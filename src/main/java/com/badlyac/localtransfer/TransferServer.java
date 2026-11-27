@@ -135,6 +135,8 @@ public final class TransferServer implements AutoCloseable {
                 uploadChunk(ex, path);
             } else if (method.equals("GET") && path.equals("/api/shared")) {
                 sharedList(ex);
+            } else if (method.equals("GET") && path.equals("/api/events")) {
+                sharedEvents(ex);
             } else if (method.equals("GET") && path.startsWith("/api/shared/")) {
                 sharedDownload(ex, path);
             } else {
@@ -514,6 +516,36 @@ public final class TransferServer implements AutoCloseable {
         List<SharedItem> items = new ArrayList<>();
         for (var s : shares.list()) items.add(new SharedItem(s.id(), s.name(), s.size()));
         json(ex, 200, items);
+    }
+
+    /** Server-sent events: tells the phone page to refresh its list whenever the PC shares/clears files. */
+    private void sharedEvents(HttpExchange ex) throws IOException {
+        if (!shares.checkToken(query(ex, "t"))) {
+            send(ex, 403, "text/plain; charset=utf-8", "forbidden".getBytes(StandardCharsets.UTF_8));
+            return;
+        }
+        java.util.concurrent.BlockingQueue<String> q = new java.util.concurrent.LinkedBlockingQueue<>();
+        Runnable l = () -> q.offer("refresh");
+        shares.addChangeListener(l);
+        try {
+            ex.getResponseHeaders().set("Content-Type", "text/event-stream");
+            ex.getResponseHeaders().set("Cache-Control", "no-store");
+            ex.sendResponseHeaders(200, 0);
+            OutputStream out = ex.getResponseBody();
+            out.write("retry: 3000\n\n".getBytes(StandardCharsets.UTF_8));
+            out.flush();
+            while (true) {
+                String msg = q.poll(20, TimeUnit.SECONDS);
+                String frame = msg == null ? ": ping\n\n" : "event: " + msg + "\ndata: 1\n\n";
+                q.clear();
+                out.write(frame.getBytes(StandardCharsets.UTF_8));
+                out.flush();
+            }
+        } catch (IOException | InterruptedException ignored) {
+            // client went away
+        } finally {
+            shares.removeChangeListener(l);
+        }
     }
 
     private void sharedDownload(HttpExchange ex, String path) throws IOException {

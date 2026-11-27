@@ -31,6 +31,28 @@ public final class ShareManager {
         this.onChange = r;
     }
 
+    private final java.util.concurrent.CopyOnWriteArrayList<Runnable> listeners =
+            new java.util.concurrent.CopyOnWriteArrayList<>();
+
+    /** Notified after every add/clear (used to push a refresh request to connected phones). */
+    public void addChangeListener(Runnable r) {
+        listeners.add(r);
+    }
+
+    public void removeChangeListener(Runnable r) {
+        listeners.remove(r);
+    }
+
+    private void fireChange() {
+        onChange.run();
+        for (Runnable r : listeners) {
+            try {
+                r.run();
+            } catch (RuntimeException ignored) {
+            }
+        }
+    }
+
     public void add(List<Path> roots) throws IOException {
         List<FileScanner.Found> found = FileScanner.scan(roots);
         synchronized (items) {
@@ -39,7 +61,7 @@ public final class ShareManager {
                 items.put(id, new Shared(id, f.name(), f.path(), f.size()));
             }
         }
-        onChange.run();
+        fireChange();
     }
 
     public List<Shared> list() {
@@ -58,7 +80,7 @@ public final class ShareManager {
         synchronized (items) {
             items.clear();
         }
-        onChange.run();
+        fireChange();
     }
 
     public boolean checkToken(String t) {
